@@ -1,6 +1,8 @@
 pub use config::NO_CONFIG_FILE_FOUND;
 use std::collections::HashMap;
-use tracing::instrument;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::{Instrument, instrument};
 
 mod config;
 mod git;
@@ -108,26 +110,55 @@ async fn run_task(x: String, root_directory_path: String) -> Result<(), std::io:
 
     let mut cmd = tokio::process::Command::new(cmd);
 
-    cmd.args(args).current_dir(&root_directory_path);
+    cmd.args(args)
+        .current_dir(&root_directory_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if !envs.is_empty() {
         cmd.envs(&envs);
     }
 
-    let output = cmd.output().await?;
+    let mut child = cmd.spawn()?;
 
-    if !output.status.success() {
-        if !output.stdout.is_empty() {
-            tracing::error!("Stdout: {}", String::from_utf8_lossy(&output.stdout));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture child stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture child stderr"))?;
+
+    let span = tracing::Span::current();
+
+    let stdout_task = tokio::spawn(
+        async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!("{line}");
+            }
         }
+        .instrument(span.clone()),
+    );
 
-        if !output.stderr.is_empty() {
-            tracing::error!("Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stderr_task = tokio::spawn(
+        async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!("{line}");
+            }
         }
+        .instrument(span),
+    );
 
+    let status = child.wait().await?;
+    let _ = tokio::join!(stdout_task, stderr_task);
+
+    if !status.success() {
         return Err(std::io::Error::other(format!(
             "Command `{x}` failed with exit code {:?}",
-            output.status.code()
+            status.code()
         )));
     }
 
